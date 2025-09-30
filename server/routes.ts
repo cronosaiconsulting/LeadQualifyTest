@@ -28,6 +28,8 @@ import { regretAnalysisService } from "./services/regret";
 import { thompsonSamplingService } from "./services/thompson-sampling";
 import { policyVariantService } from "./services/policy-variants";
 import { safetyService } from "./services/safety";
+import { messageComposer, MessageComposer } from "./services/message-composer";
+import { metricRegistry, type MetricContext } from "./services/metric-documentation";
 
 // Knowledge Graph API Validation Schemas
 const knowledgeGraphStatsQuerySchema = z.object({
@@ -240,21 +242,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
           decisionContext
         );
 
-        // Send response via WhatsApp
+        // Build message context for humanization
+        const messageContext = await MessageComposer.buildContext(
+          conversation.id,
+          selectedQuestion.question
+        );
+
+        // Compose natural message from raw question
+        const humanizedMessage = await messageComposer.composeMessage(
+          selectedQuestion.question,
+          messageContext
+        );
+
+        // Send humanized message via WhatsApp
         const sent = await whatsappService.sendMessage(
           conversation.whatsappId,
-          selectedQuestion.question.questionText
+          humanizedMessage
         );
 
         if (sent) {
-          // Save outgoing message
+          // Save outgoing message with both raw and humanized versions
           await storage.addMessage({
             conversationId: conversation.id,
             whatsappMessageId: null,
             direction: 'outgoing',
-            content: selectedQuestion.question.questionText,
+            content: humanizedMessage,
             messageType: 'text',
-            metadata: { questionId: selectedQuestion.question.id, decisionTraceId: decisionTrace.id }
+            metadata: {
+              questionId: selectedQuestion.question.id,
+              decisionTraceId: decisionTrace.id,
+              rawQuestion: selectedQuestion.question.questionText,
+              messagePhase: messageContext.phase
+            }
           });
 
           // Update question usage stats
@@ -1959,6 +1978,94 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       tracingService.recordError('GET', '/api/system/slo', error as Error, (req as any).traceId);
       res.status(500).json({ error: 'Failed to fetch SLO data' });
+    }
+  });
+
+  // ============================================================================
+  // METRIC DOCUMENTATION API
+  // ============================================================================
+
+  // Get all metric documentation
+  app.get('/api/metrics/documentation', async (req, res) => {
+    try {
+      const documentation = metricRegistry.getAllDocumentation();
+      res.json(documentation);
+    } catch (error) {
+      console.error('Metric documentation error:', error);
+      res.status(500).json({ error: 'Failed to fetch metric documentation' });
+    }
+  });
+
+  // Get documentation for a specific metric
+  app.get('/api/metrics/:metricId/documentation', async (req, res) => {
+    try {
+      const { metricId } = req.params;
+      const metric = metricRegistry.get(metricId);
+
+      if (!metric) {
+        return res.status(404).json({ error: 'Metric not found' });
+      }
+
+      res.json(metric.toJSON());
+    } catch (error) {
+      console.error('Metric documentation error:', error);
+      res.status(500).json({ error: 'Failed to fetch metric documentation' });
+    }
+  });
+
+  // Explain a specific metric value in context
+  app.get('/api/metrics/:metricId/explain', async (req, res) => {
+    try {
+      const { metricId } = req.params;
+      const value = parseFloat(req.query.value as string);
+      const conversationId = req.query.conversationId as string;
+
+      if (isNaN(value)) {
+        return res.status(400).json({ error: 'Invalid value parameter' });
+      }
+
+      const metric = metricRegistry.get(metricId);
+      if (!metric) {
+        return res.status(404).json({ error: 'Metric not found' });
+      }
+
+      // Build context
+      const context: MetricContext = {
+        value,
+        conversationPhase: req.query.phase as string || 'unknown',
+        messageCount: parseInt(req.query.messageCount as string) || 0,
+        timestamp: new Date()
+      };
+
+      if (req.query.previousValue) {
+        context.previousValue = parseFloat(req.query.previousValue as string);
+      }
+
+      const explanation = metric.explain(context);
+      const interpretation = metric.interpret(value);
+
+      res.json({
+        metric: metric.toJSON(),
+        context,
+        explanation,
+        interpretation
+      });
+    } catch (error) {
+      console.error('Metric explanation error:', error);
+      res.status(500).json({ error: 'Failed to explain metric' });
+    }
+  });
+
+  // Get all metrics for a specific dimension
+  app.get('/api/metrics/dimension/:dimension', async (req, res) => {
+    try {
+      const { dimension } = req.params;
+      const metrics = metricRegistry.getByDimension(dimension);
+
+      res.json(metrics.map(m => m.toJSON()));
+    } catch (error) {
+      console.error('Dimension metrics error:', error);
+      res.status(500).json({ error: 'Failed to fetch dimension metrics' });
     }
   });
 

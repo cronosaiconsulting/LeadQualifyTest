@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(chmod:*)",
+      "Bash(tail:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

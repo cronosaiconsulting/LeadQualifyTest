@@ -1,15 +1,27 @@
-import type { 
-  SituationAwarenessState, 
-  ConversationMetrics, 
+import type {
+  SituationAwarenessState,
+  ConversationMetrics,
   InsertConversationMetrics,
   Message
 } from "@shared/schema";
 import { openaiService } from "./openai";
+import { grokNLPService, type MessageAnalysis } from "./grok-nlp";
 
 export interface MetricCalculationResult {
   metrics: InsertConversationMetrics;
   explanations: Record<string, string>;
   confidences: Record<string, number>;
+  grokAnalysis?: MessageAnalysis; // Include Grok NLP analysis
+}
+
+export interface SMBMetrics {
+  budgetQualification: number;
+  spocAvailability: number;
+  digitalMaturity: number;
+  smbFitScore: number;
+  budgetConfidence: number;
+  spocConfidence: number;
+  maturityConfidence: number;
 }
 
 export class MetricsService {
@@ -26,11 +38,20 @@ export class MetricsService {
     const userMessages = messages.filter(m => m.direction === 'incoming');
     const systemMessages = messages.filter(m => m.direction === 'outgoing');
 
-    // Analyze latest user message with AI
+    // Analyze latest user message with Grok NLP (Castilian Spanish)
     const latestUserMessage = userMessages[userMessages.length - 1];
     let messageAnalysis = null;
-    
+    let grokAnalysis: MessageAnalysis | null = null;
+
     if (latestUserMessage) {
+      // Use Grok for Spanish B2B NLP analysis
+      const conversationHistory = messages.slice(-4).map(m => m.content);
+      grokAnalysis = await grokNLPService.analyzeMessage(
+        latestUserMessage.content,
+        conversationHistory
+      );
+
+      // Keep OpenAI for backward compatibility (can be removed later)
       messageAnalysis = await openaiService.analyzeMessage(latestUserMessage.content);
     }
 
@@ -48,7 +69,10 @@ export class MetricsService {
     
     // Calculate cultural metrics
     const culturalMetrics = this.calculateCulturalMetrics(userMessages, messageAnalysis);
-    
+
+    // Calculate SMB-specific metrics using Grok analysis
+    const smbMetrics = this.calculateSMBMetrics(userMessages, grokAnalysis);
+
     // Calculate meta metrics
     const metaMetrics = this.calculateMetaMetrics(
       messageCount,
@@ -152,17 +176,20 @@ export class MetricsService {
         emotional: emotionalMetrics,
         cultural: culturalMetrics,
         meta: metaMetrics,
-        messageAnalysis
+        messageAnalysis,
+        smb: smbMetrics,
+        grokAnalysis
       }
     };
 
-    const explanations = await this.generateExplanations(metrics);
+    const explanations = await this.generateExplanations(metrics, smbMetrics);
     const confidences = this.calculateConfidences(metrics, messageCount);
 
     return {
       metrics,
       explanations,
-      confidences
+      confidences,
+      grokAnalysis: grokAnalysis || undefined
     };
   }
 
@@ -755,10 +782,10 @@ export class MetricsService {
     // Formality index
     const formalIndicators = ['usted', 'señor', 'señora', 'disculpe', 'le agradezco'];
     const informalIndicators = ['tú', 'tu', 'gracias', 'vale', 'ok'];
-    
+
     let formalCount = 0;
     let informalCount = 0;
-    
+
     userMessages.forEach(msg => {
       formalIndicators.forEach(indicator => {
         if (msg.content.toLowerCase().includes(indicator)) formalCount++;
@@ -767,17 +794,17 @@ export class MetricsService {
         if (msg.content.toLowerCase().includes(indicator)) informalCount++;
       });
     });
-    
+
     const totalIndicators = formalCount + informalCount;
     const formality = totalIndicators > 0 ? formalCount / totalIndicators : 0.5;
 
     // Communication style
     const directnessIndicators = ['necesito', 'quiero', 'no me gusta', 'directamente'];
     const indirectnessIndicators = ['quizás', 'tal vez', 'podría ser', 'me gustaría'];
-    
+
     let directCount = 0;
     let indirectCount = 0;
-    
+
     userMessages.forEach(msg => {
       directnessIndicators.forEach(indicator => {
         if (msg.content.toLowerCase().includes(indicator)) directCount++;
@@ -786,16 +813,16 @@ export class MetricsService {
         if (msg.content.toLowerCase().includes(indicator)) indirectCount++;
       });
     });
-    
+
     const style = directCount > indirectCount ? 'direct' : 'indirect';
 
     // Regional culture detection (basic)
     const spainIndicators = ['vale', 'tío', 'guay', 'joder'];
     const latamIndicators = ['wey', 'che', 'pana', 'bacano'];
-    
+
     let spainCount = 0;
     let latamCount = 0;
-    
+
     userMessages.forEach(msg => {
       spainIndicators.forEach(indicator => {
         if (msg.content.toLowerCase().includes(indicator)) spainCount++;
@@ -804,7 +831,7 @@ export class MetricsService {
         if (msg.content.toLowerCase().includes(indicator)) latamCount++;
       });
     });
-    
+
     const culture = spainCount > latamCount ? 'ES' : 'LATAM';
 
     return {
@@ -813,6 +840,99 @@ export class MetricsService {
       culture,
       appropriateness: 0.7, // Would need more sophisticated analysis
       adaptation: 0.6       // Would need historical comparison
+    };
+  }
+
+  /**
+   * Calculate SMB-specific consulting metrics using Grok NLP analysis
+   */
+  private calculateSMBMetrics(userMessages: Message[], grokAnalysis: MessageAnalysis | null): SMBMetrics {
+    if (!grokAnalysis || userMessages.length === 0) {
+      return {
+        budgetQualification: 0,
+        spocAvailability: 0,
+        digitalMaturity: 0,
+        smbFitScore: 0,
+        budgetConfidence: 0,
+        spocConfidence: 0,
+        maturityConfidence: 0
+      };
+    }
+
+    // Budget Qualification (minimum 5,000€)
+    const budgetSignals = grokAnalysis.budgetSignals;
+    let budgetQualification = 0;
+
+    if (budgetSignals.hasExplicitBudget && budgetSignals.meetsMinimum) {
+      budgetQualification = 0.9; // Very high confidence
+    } else if (budgetSignals.meetsMinimum) {
+      budgetQualification = 0.7; // Implicit signals suggest minimum met
+    } else if (budgetSignals.hasExplicitBudget && !budgetSignals.meetsMinimum) {
+      budgetQualification = 0.2; // Explicitly too low
+    } else if (budgetSignals.budgetIndicators.length > 0) {
+      budgetQualification = 0.4; // Some budget discussion but unclear
+    }
+
+    // Apply Grok confidence
+    budgetQualification *= budgetSignals.confidence;
+
+    // SPOC Availability (minimum 4 hours/week)
+    const spocSignals = grokAnalysis.spocAvailability;
+    let spocAvailability = 0;
+
+    if (spocSignals.hasDesignatedContact && spocSignals.meetsMinimum) {
+      spocAvailability = 0.9; // Explicit SPOC with sufficient time
+    } else if (spocSignals.meetsMinimum) {
+      spocAvailability = 0.7; // Time commitment confirmed
+    } else if (spocSignals.hasDesignatedContact) {
+      spocAvailability = 0.5; // SPOC exists but time unclear
+    } else if (spocSignals.availabilityIndicators.length > 0) {
+      spocAvailability = 0.4; // Some availability signals
+    }
+
+    // Apply Grok confidence
+    spocAvailability *= spocSignals.confidence;
+
+    // Digital Maturity (medium level required)
+    const maturitySignals = grokAnalysis.digitalMaturity;
+    let digitalMaturity = 0;
+
+    // Base score from maturity level
+    if (maturitySignals.maturityLevel === 'high') {
+      digitalMaturity = 0.85;
+    } else if (maturitySignals.maturityLevel === 'medium') {
+      digitalMaturity = 0.65; // Ideal target
+    } else if (maturitySignals.maturityLevel === 'low') {
+      digitalMaturity = 0.3;
+    }
+
+    // Boost for specific indicators
+    if (maturitySignals.hasCurrentTools) digitalMaturity += 0.1;
+    if (maturitySignals.hasProcesses) digitalMaturity += 0.05;
+    if (maturitySignals.hasTechnicalTeam) digitalMaturity += 0.05;
+
+    // Cap at 1.0
+    digitalMaturity = Math.min(1, digitalMaturity);
+
+    // Apply Grok confidence
+    digitalMaturity *= maturitySignals.confidence;
+
+    // SMB Fit Score (composite)
+    // All three must be reasonably strong for good fit
+    const smbFitScore = (
+      budgetQualification * 0.4 +
+      spocAvailability * 0.3 +
+      digitalMaturity * 0.3
+    );
+
+    return {
+      budgetQualification: Math.max(0, Math.min(1, budgetQualification)),
+      spocAvailability: Math.max(0, Math.min(1, spocAvailability)),
+      digitalMaturity: Math.max(0, Math.min(1, digitalMaturity)),
+      smbFitScore: Math.max(0, Math.min(1, smbFitScore)),
+      budgetConfidence: budgetSignals.confidence,
+      spocConfidence: spocSignals.confidence,
+      maturityConfidence: maturitySignals.confidence
     };
   }
 
@@ -901,13 +1021,20 @@ export class MetricsService {
     return Math.sqrt(variance);
   }
 
-  private async generateExplanations(metrics: InsertConversationMetrics): Promise<Record<string, string>> {
+  private async generateExplanations(
+    metrics: InsertConversationMetrics,
+    smbMetrics: SMBMetrics
+  ): Promise<Record<string, string>> {
     return {
       engagement: `Engagement score: ${metrics.engagementScore?.toFixed(2)} - Based on response velocity (${metrics.responseVelocity?.toFixed(2)}) and message depth`,
       qualification: `Qualification score: ${metrics.qualificationScore?.toFixed(2)} - Budget signals: ${metrics.budgetSignalStrength?.toFixed(2)}, Authority: ${metrics.authorityScore?.toFixed(2)}`,
       technical: `Technical score: ${metrics.technicalScore?.toFixed(2)} - Sophistication level indicates ${metrics.sophisticationLevel && metrics.sophisticationLevel > 0.5 ? 'high' : 'basic'} technical knowledge`,
       emotional: `Emotional score: ${metrics.emotionalScore?.toFixed(2)} - Trust: ${metrics.trustLevel?.toFixed(2)}, Frustration: ${metrics.frustrationLevel?.toFixed(2)}`,
-      cultural: `Cultural adaptation: ${metrics.culturalScore?.toFixed(2)} - Formality index: ${metrics.formalityIndex?.toFixed(2)}`
+      cultural: `Cultural adaptation: ${metrics.culturalScore?.toFixed(2)} - Formality index: ${metrics.formalityIndex?.toFixed(2)}`,
+      smb_budget: `Budget Qualification: ${smbMetrics.budgetQualification.toFixed(2)} - ${smbMetrics.budgetQualification >= 0.7 ? 'Meets 5,000€ minimum' : 'Below minimum or unclear'}`,
+      smb_spoc: `SPOC Availability: ${smbMetrics.spocAvailability.toFixed(2)} - ${smbMetrics.spocAvailability >= 0.6 ? 'Sufficient time commitment (≥4hrs/week)' : 'Insufficient or unclear'}`,
+      smb_maturity: `Digital Maturity: ${smbMetrics.digitalMaturity.toFixed(2)} - ${smbMetrics.digitalMaturity >= 0.5 ? 'Medium+ maturity (good fit)' : 'Low maturity (poor fit)'}`,
+      smb_fit: `SMB Fit Score: ${smbMetrics.smbFitScore.toFixed(2)} - ${smbMetrics.smbFitScore >= 0.7 ? 'HIGH PRIORITY LEAD' : smbMetrics.smbFitScore >= 0.5 ? 'Continue qualifying' : 'Low priority / disqualify'}`
     };
   }
 
